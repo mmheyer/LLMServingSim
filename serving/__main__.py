@@ -339,8 +339,22 @@ def main():
 
     # Controller for astra-sim process communication
     controller = Controller(total_npu)
+    # Collect per-instance WAN (router<->instance) link parameters
+    wan_latency_ns = {}
+    wan_bw_bytes_per_ns = {}
+    for i in range(num_instances):
+        inst = instances[i]
+        if "wan_latency_ns" in inst:
+            wan_latency_ns[i] = int(inst["wan_latency_ns"])
+        if "wan_bw_gbps" in inst:
+            # Gbps -> bytes/ns: gbps * 1e9 bits/s / 8 bits/byte / 1e9 ns/s == gbps / 8
+            wan_bw_bytes_per_ns[i] = float(inst["wan_bw_gbps"]) / 8.0
     # Global Request Router
-    router = Router(num_instances, schedulers, num_req, request_routing_policy)
+    router = Router(
+        num_instances, schedulers, num_req, request_routing_policy,
+        wan_latency_ns=wan_latency_ns,
+        wan_bw_bytes_per_ns=wan_bw_bytes_per_ns,
+    )
     # Power Modeling if enabled
     if power_modeling:
         power_model = PowerModel(power_configs)
@@ -460,10 +474,14 @@ def main():
         # count only finished requests
         req_cnt += len(finished_reqs) if instances[instance_id]["pd_type"] != "prefill" else 0
 
-        # Notify router of completed requests for dependency chain release
+        # Notify router of completed requests for dependency chain release.
+        # Inbound WAN delay (instance -> router): response payload is small
+        # (status + final token ids), use a coarse 64-byte estimate.
         if instances[instance_id]["pd_type"] != "prefill":
+            response_bytes = 64
             for req in finished_reqs:
-                router.notify_request_completed(req.id, current)
+                inbound_delay = router.link_delay_ns(req.instance_id, response_bytes)
+                router.notify_request_completed(req.id, current + inbound_delay)
 
         # Add prefill ended requests to decode instance
         if instances[instance_id]["pd_type"] == "prefill" and len(finished_reqs) > 0:

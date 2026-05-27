@@ -10,7 +10,9 @@ class Router:
             num_instances,
             schedulers, req_num,
             routing_policy="RR",
-            seed=42
+            seed=42,
+            wan_latency_ns=None,
+            wan_bw_bytes_per_ns=None,
     ):
         self.schedulers = schedulers
         self.num_instances = num_instances
@@ -24,6 +26,12 @@ class Router:
         self._rnd = random.Random(seed) if seed is not None else random
         self.prefill_rr_counter = 0
         self.decode_rr_counter = 0
+
+        # Per-instance WAN (router<->instance) link parameters.
+        # wan_latency_ns: dict[int, int]   instance_id -> fixed one-way latency in ns
+        # wan_bw_bytes_per_ns: dict[int, float]  instance_id -> bandwidth in bytes/ns
+        self._wan_latency_ns = wan_latency_ns or {}
+        self._wan_bw_bytes_per_ns = wan_bw_bytes_per_ns or {}
 
         # Pending requests (loaded but not yet routed)
         self._pending_requests = []
@@ -80,6 +88,23 @@ class Router:
 
     def _custom_select(self, num_instances):
         raise NotImplementedError("Implement custom routing policy.")
+
+    # -----------------------------------------------------------------------
+    # WAN link model
+    # -----------------------------------------------------------------------
+
+    def link_delay_ns(self, instance_id, payload_bytes=0):
+        """One-way router<->instance link delay (ns) for the given payload size.
+
+        Used for both outbound (router -> instance) and inbound (instance ->
+        router) hops. The link is modeled as symmetric, so the same value
+        applies in either direction.
+        """
+        fixed = self._wan_latency_ns.get(instance_id, 0)
+        bw = self._wan_bw_bytes_per_ns.get(instance_id, 0.0)
+        if bw > 0 and payload_bytes > 0:
+            return fixed + int(payload_bytes / bw)
+        return fixed
 
     # -----------------------------------------------------------------------
     # Request loading and real-time routing
@@ -186,18 +211,26 @@ class Router:
             instance_id = self._select_instance(self.prefill_instances)
             sched = self.prefill_schedulers[instance_id]
 
+            # Outbound WAN delay (router -> instance). Payload is a coarse
+            # estimate from input tokens (~4 bytes per token id).
+            payload_bytes = req_data['input_toks'] * 4
+            effective_arrival = (
+                req_data['arrival_time_ns']
+                + self.link_delay_ns(instance_id, payload_bytes)
+            )
+
             if self._enable_prefix_caching:
                 sched.add_request([
                     req_data['index'], sched.model,
                     req_data['input_toks'], req_data['output_toks'],
-                    req_data['arrival_time_ns'], instance_id,
+                    effective_arrival, instance_id,
                     req_data['input_hash_ids'], req_data['output_hash_ids'],
                 ], is_init=self._is_init)
             else:
                 sched.add_request([
                     req_data['index'], sched.model,
                     req_data['input_toks'], req_data['output_toks'],
-                    req_data['arrival_time_ns'], instance_id,
+                    effective_arrival, instance_id,
                 ], is_init=self._is_init)
 
             self._pending_idx += 1
